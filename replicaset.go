@@ -247,6 +247,27 @@ func fmtUpdatedMembersForLog(membersToLog []Member) string {
 // applyReplSetConfigChanges applies the specified changes to the mongo session.
 // It also logs what the changes are.
 func applyReplSetConfigChanges(cmd string, session mgoSession, currentConfig *Config, updated []Member, added []Member, removed []int) error {
+	err := doReplSetConfigChanges(cmd, session, currentConfig, updated, added, removed)
+	if errors.Is(err, repairNeeded) {
+		// A quorum-check failure can happen during update, add, or remove when a
+		// member being removed is down. Repair once by forcing out confirmed-dead
+		// removed members, then retry against the refreshed config.
+		if err := repairReplicaSet(session, removed); err != nil {
+			return errors.Annotatef(err, "repairing replicaset")
+		}
+		repairedConfig, err := getCurrentConfig(session)
+		if err != nil {
+			return err
+		}
+		return doReplSetConfigChanges(cmd, session, repairedConfig, updated, added, removed)
+	}
+	return err
+}
+
+// doReplSetConfigChanges applies the updates, adds and removes one change at a
+// time. Any step whose reconfig loses quorum returns repairNeeded so the caller
+// can force-remove the dead member and retry.
+func doReplSetConfigChanges(cmd string, session mgoSession, currentConfig *Config, updated []Member, added []Member, removed []int) error {
 	logger.Debugf("%s() changing replica set\n%s\n- updated:\n%#v\n- added:\n%s\n- removed: %v",
 		cmd, fmtConfigForLog(currentConfig), fmtUpdatedMembersForLog(updated), fmtMembersForLog(added), removed)
 
@@ -273,34 +294,40 @@ func applyReplSetConfigChanges(cmd string, session mgoSession, currentConfig *Co
 		}
 		newConfig.Version++
 		err := applyReplSetConfig(cmd, session, newConfig)
+		if errors.Is(err, repairNeeded) {
+			return err
+		}
 		if err != nil {
 			return fmt.Errorf("cannot update member %#v in replicaset: %v", u, err)
 		}
 	}
 	// Then the adds.
 	for _, m := range added {
+		// On a post-repair retry the member may already be present; skip it so
+		// the reconfig stays idempotent (mirrors Add's duplicate handling).
+		alreadyPresent := false
+		for _, existing := range newConfig.Members {
+			if sameAddress(existing.Address, m.Address) {
+				alreadyPresent = true
+				break
+			}
+		}
+		if alreadyPresent {
+			continue
+		}
 		newConfig.Version++
 		newConfig.Members = append(newConfig.Members, m)
 		err := applyReplSetConfig(cmd, session, newConfig)
+		if errors.Is(err, repairNeeded) {
+			return err
+		}
 		if err != nil {
 			return fmt.Errorf("cannot add member %#v to replicaset: %v", m, err)
 		}
 	}
 
 	// Then do the removes.
-	err := applyRemoves(cmd, session, newConfig, removed)
-	if errors.Is(err, repairNeeded) {
-		// If the replicaset gets out of sync, attempt a repair and retry.
-		if err := repairReplicaSet(session, removed); err != nil {
-			return errors.Annotatef(err, "repairing replicaset")
-		}
-		updatedConfig, err := getCurrentConfig(session)
-		if err != nil {
-			return err
-		}
-		return applyRemoves(cmd, session, *updatedConfig, removed)
-	}
-	return err
+	return applyRemoves(cmd, session, newConfig, removed)
 }
 
 func applyRemoves(cmd string, session mgoSession, newConfig Config, removed []int) error {
@@ -349,14 +376,8 @@ var repairNeeded = errors.ConstError("repair needed")
 // If so, it Refreshes the session and tries to Ping again.
 func applyReplSetConfig(cmd string, session mgoSession, newConfig Config) error {
 	err := session.Run(bson.D{{"replSetReconfig", newConfig}}, nil)
-	if err != nil {
-		qe, ok := err.(*mgo.QueryError)
-		// This error occurs when the replicaset changes can't be synced
-		// to all nodes and the primary is forced to become a secondary
-		// because quorum is lost.
-		if ok && qe.Code == 11602 {
-			return repairNeeded
-		}
+	if isQuorumCheckFailure(err) {
+		return repairNeeded
 	}
 	if err == io.EOF {
 		// If the primary changes due to replSetReconfig, then all
@@ -381,6 +402,17 @@ func applyReplSetConfig(cmd string, session mgoSession, newConfig Config) error 
 	return err
 }
 
+func isQuorumCheckFailure(err error) bool {
+	// Quorum was lost applying the reconfig. Some server versions report this
+	// as a message rather than code 11602, so match either, but only within a
+	// QueryError so an unrelated error can't trigger a force repair.
+	qe, ok := err.(*mgo.QueryError)
+	if !ok || qe == nil {
+		return false
+	}
+	return qe.Code == 11602 || strings.Contains(qe.Message, "Quorum check failed")
+}
+
 // repairReplicaSet will remove any unhealthy nodes that are in the
 // removed list and then force a remaining secondary to become a primary.
 func repairReplicaSet(session mgoSession, removed []int) error {
@@ -389,27 +421,35 @@ func repairReplicaSet(session mgoSession, removed []int) error {
 		return errors.Annotatef(err, "getting rs config to repair")
 	}
 
-	status, err := getCurrentStatus(session)
+	removedIds := set.NewInts(removed...)
+
+	// Only force out members we were asked to remove that are confirmed dead
+	// (see confirmDeadMembers), so a transient blip can't evict a live node.
+	dead, unhealthy, err := confirmDeadMembers(session, removedIds)
 	if err != nil {
-		return errors.Annotatef(err, "getting rs status to repair")
+		return err
+	}
+	if dead.Size() == 0 {
+		if unhealthy.Size() > 0 {
+			// Unhealthy members exist but none is one we're removing:
+			// ambiguous, so refuse to force.
+			return errors.Errorf(
+				"cannot repair replicaset: unhealthy members %v, none in removed ids %v was confirmed dead",
+				unhealthy.SortedValues(), removedIds.SortedValues())
+		}
+		// Nothing dead to remove; let the caller re-drive the reconfig.
+		return nil
 	}
 
 	cfg.Version++
-	removedIds := set.NewInts(removed...)
-	haveChanges := false
-	haveUnhealthy := false
-	for n, m := range status.Members {
-		haveUnhealthy = haveUnhealthy || !m.Healthy
-		if !m.Healthy && removedIds.Contains(m.Id) {
-			haveChanges = true
-			cfg.Members = append(cfg.Members[:n], cfg.Members[n+1:]...)
+	var remaining []Member
+	for _, m := range cfg.Members {
+		if dead.Contains(m.Id) {
+			continue
 		}
+		remaining = append(remaining, m)
 	}
-	// If there are unhealthy nodes not in the to remove list,
-	// we can't safely repair.
-	if !haveChanges && haveUnhealthy {
-		return errors.Errorf("cannot repair replicaset")
-	}
+	cfg.Members = remaining
 	err = session.Run(bson.D{
 		{"replSetReconfig", *cfg},
 		{"force", "true"},
@@ -438,6 +478,51 @@ gotprimary:
 	return nil
 }
 
+// confirmDeadSamples and confirmDeadInterval control how confirmDeadMembers
+// re-samples the replicaset status. Variables so tests can patch them.
+var (
+	confirmDeadSamples  = 3
+	confirmDeadInterval = 2 * time.Second
+)
+
+// confirmDeadMembers re-samples the replicaset status to decide which of the
+// wanted members are genuinely dead. A member is treated as dead only if it is
+// unhealthy AND reports DOWN in every sample, so a transient health blip cannot
+// trigger a forced removal. unhealthy holds the ids of members that were
+// unhealthy in the last sample taken, so the caller can report them.
+func confirmDeadMembers(session mgoSession, want set.Ints) (dead set.Ints, unhealthy set.Ints, err error) {
+	dead = set.NewInts()
+	unhealthy = set.NewInts()
+	for i := 0; i < confirmDeadSamples; i++ {
+		if i > 0 {
+			time.Sleep(confirmDeadInterval)
+		}
+		status, err := getCurrentStatus(session)
+		if err != nil {
+			return set.NewInts(), set.NewInts(), errors.Annotatef(err, "getting rs status to confirm dead members")
+		}
+		downNow := set.NewInts()
+		unhealthy = set.NewInts()
+		for _, m := range status.Members {
+			if !m.Healthy {
+				unhealthy.Add(m.Id)
+			}
+			if want.Contains(m.Id) && !m.Healthy && m.State == DownState {
+				downNow.Add(m.Id)
+			}
+		}
+		if i == 0 {
+			dead = downNow
+		} else {
+			dead = dead.Intersection(downNow)
+		}
+		if dead.Size() == 0 {
+			return dead, unhealthy, nil
+		}
+	}
+	return dead, unhealthy, nil
+}
+
 var localHostIpv4 = regexp.MustCompile(`127\.0\.0\.\d+`)
 
 func isLocalhost(addr string) bool {
@@ -445,6 +530,10 @@ func isLocalhost(addr string) bool {
 		addr == "0:0:0:0:0:0:0:1" ||
 		localHostIpv4.MatchString(addr) ||
 		addr == "localhost"
+}
+
+func sameAddress(a, b string) bool {
+	return a == b || isLocalhost(a) && isLocalhost(b)
 }
 
 // Add adds the given members to the session's replica set.  Duplicates of
@@ -463,8 +552,7 @@ func Add(session mgoSession, members ...Member) error {
 outerLoop:
 	for _, newMember := range members {
 		for _, member := range config.Members {
-			if member.Address == newMember.Address ||
-				isLocalhost(member.Address) && isLocalhost(newMember.Address) {
+			if sameAddress(member.Address, newMember.Address) {
 				// already exists, skip it
 				continue outerLoop
 			}
@@ -489,8 +577,7 @@ func Remove(session mgoSession, addrs ...string) error {
 	var toRemove []int
 	for _, rem := range addrs {
 		for _, repl := range config.Members {
-			if repl.Address == rem ||
-				isLocalhost(repl.Address) && isLocalhost(rem) {
+			if sameAddress(repl.Address, rem) {
 				toRemove = append(toRemove, repl.Id)
 				break
 			}

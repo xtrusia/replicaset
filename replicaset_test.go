@@ -784,8 +784,12 @@ func (s *MongoIPV6Suite) TestAddressFixing(c *gc.C) {
 
 type mockSession struct {
 	mgoSession
-	cfg      *Config
-	repaired bool
+	cfg         *Config
+	repaired    bool
+	reconfigErr error
+	// failWhen selects which reconfig loses quorum; when nil the remove
+	// leaving only member 666 fails.
+	failWhen func(cfg Config) bool
 }
 
 func (m *mockSession) Run(cmd interface{}, _ interface{}) error {
@@ -807,7 +811,16 @@ func (m *mockSession) Run(cmd interface{}, _ interface{}) error {
 		}
 		m.repaired = true
 	}
-	if !m.repaired && len(cfg.Members) == 1 && cfg.Members[0].Id == 666 {
+	failWhen := m.failWhen
+	if failWhen == nil {
+		failWhen = func(cfg Config) bool {
+			return len(cfg.Members) == 1 && cfg.Members[0].Id == 666
+		}
+	}
+	if !m.repaired && failWhen(cfg) {
+		if m.reconfigErr != nil {
+			return m.reconfigErr
+		}
 		return &mgo.QueryError{Code: 11602}
 	}
 	m.cfg = &cfg
@@ -828,9 +841,10 @@ var _ = gc.Suite(&changesSuite{})
 func (s *changesSuite) SetUpTest(c *gc.C) {
 	s.PatchValue(&getCurrentConfig, func(session mgoSession) (*Config, error) {
 		return &Config{
-			Members: s.current,
+			Members: append([]Member(nil), s.current...),
 		}, nil
 	})
+	s.PatchValue(&confirmDeadInterval, time.Duration(0))
 }
 
 func (s *changesSuite) TestSetNoChanges(c *gc.C) {
@@ -1000,19 +1014,7 @@ func (s *changesSuite) TestSetUpdateAndRemoves(c *gc.C) {
 }
 
 func (s *changesSuite) TestRepair(c *gc.C) {
-	mockCurentStatus := func(session mgoSession) (*Status, error) {
-		return &Status{
-			Name: "test",
-			Members: []MemberStatus{{
-				Id:    666,
-				State: PrimaryState,
-			}, {
-				Id:      1,
-				Healthy: false,
-			}},
-		}, nil
-	}
-	s.PatchValue(&getCurrentStatus, mockCurentStatus)
+	s.setupRepairStatus(c)
 
 	s.current = []Member{{
 		Id:      1,
@@ -1036,6 +1038,232 @@ func (s *changesSuite) TestRepair(c *gc.C) {
 		}},
 	})
 	c.Assert(m.repaired, jc.IsTrue)
+}
+
+func (s *changesSuite) TestRepairQuorumCheckFailureMessage(c *gc.C) {
+	s.setupRepairStatus(c)
+
+	s.current = []Member{{
+		Id:      1,
+		Address: "10.0.0.1",
+	}, {
+		Id:      666,
+		Address: "10.0.0.2",
+	}}
+	m := &mockSession{
+		reconfigErr: &mgo.QueryError{
+			Message: "Quorum check failed because not enough voting nodes responded",
+		},
+	}
+	wantMembers := []Member{{
+		Id:      666,
+		Address: "10.0.0.2",
+	}}
+	err := Set(m, wantMembers)
+	c.Assert(err, jc.ErrorIsNil)
+	c.Assert(m.cfg, jc.DeepEquals, &Config{
+		Version: 1,
+		Members: []Member{{
+			Id:      666,
+			Address: "10.0.0.2",
+		}},
+	})
+	c.Assert(m.repaired, jc.IsTrue)
+}
+
+func (s *changesSuite) TestRepairDuringUpdate(c *gc.C) {
+	s.setupRepairStatus(c)
+
+	s.current = []Member{{
+		Id:      1,
+		Address: "10.0.0.1",
+	}, {
+		Id:      666,
+		Address: "10.0.0.2",
+	}}
+	m := &mockSession{
+		// Fail the update reconfig, before the remove step is reached.
+		failWhen: func(cfg Config) bool { return len(cfg.Members) == 2 },
+	}
+	s.patchConfigFromSession(c, m)
+	wantMembers := []Member{{
+		Id:      666,
+		Address: "10.0.0.3",
+	}}
+	err := Set(m, wantMembers)
+	c.Assert(err, jc.ErrorIsNil)
+	c.Assert(m.cfg, jc.DeepEquals, &Config{
+		Version: 2,
+		Members: []Member{{
+			Id:      666,
+			Address: "10.0.0.3",
+		}},
+	})
+	c.Assert(m.repaired, jc.IsTrue)
+}
+
+func (s *changesSuite) TestRepairDuringAdd(c *gc.C) {
+	s.setupRepairStatus(c)
+
+	s.current = []Member{{
+		Id:      1,
+		Address: "10.0.0.1",
+	}, {
+		Id:      666,
+		Address: "10.0.0.2",
+	}}
+	m := &mockSession{
+		// The first add succeeds, the second one loses quorum. The re-drive
+		// must skip the already added member and the already removed one.
+		failWhen: func(cfg Config) bool { return len(cfg.Members) == 4 },
+	}
+	s.patchConfigFromSession(c, m)
+	wantMembers := []Member{{
+		Id:      666,
+		Address: "10.0.0.2",
+	}, {
+		Id:      667,
+		Address: "10.0.0.3",
+	}, {
+		Id:      668,
+		Address: "10.0.0.4",
+	}}
+	err := Set(m, wantMembers)
+	c.Assert(err, jc.ErrorIsNil)
+	c.Assert(m.cfg, jc.DeepEquals, &Config{
+		Version: 3,
+		Members: []Member{{
+			Id:      666,
+			Address: "10.0.0.2",
+		}, {
+			Id:       667,
+			Address:  "10.0.0.3",
+			Priority: &one,
+			Votes:    &votes,
+		}, {
+			Id:       668,
+			Address:  "10.0.0.4",
+			Priority: &one,
+			Votes:    &votes,
+		}},
+	})
+	c.Assert(m.repaired, jc.IsTrue)
+}
+
+func (s *changesSuite) TestRetrySkipsLocalhostEquivalentAdd(c *gc.C) {
+	m := &mockSession{}
+	err := doReplSetConfigChanges("Add", m, &Config{
+		Members: []Member{{
+			Id:      1,
+			Address: "127.0.0.1",
+		}},
+	}, nil, []Member{{
+		Id:      2,
+		Address: "localhost",
+	}}, nil)
+	c.Assert(err, jc.ErrorIsNil)
+	c.Assert(m.cfg, gc.IsNil)
+}
+
+func (s *changesSuite) TestQuorumCheckFailureTypedNil(c *gc.C) {
+	var err *mgo.QueryError
+	c.Assert(isQuorumCheckFailure(err), jc.IsFalse)
+}
+
+func (s *changesSuite) TestRepairErrorIncludesUnhealthyIds(c *gc.C) {
+	s.PatchValue(&getCurrentStatus, func(session mgoSession) (*Status, error) {
+		return &Status{
+			Members: []MemberStatus{{
+				Id:      2,
+				Healthy: false,
+				State:   DownState,
+			}, {
+				Id:      3,
+				Healthy: false,
+				State:   UnknownState,
+			}},
+		}, nil
+	})
+
+	err := repairReplicaSet(&mockSession{}, []int{1})
+	c.Assert(err, gc.ErrorMatches,
+		`cannot repair replicaset: unhealthy members \[2 3\], none in removed ids \[1\] was confirmed dead`)
+}
+
+func (s *changesSuite) TestNoRepairForTransientlyDownMember(c *gc.C) {
+	statusCalls := 0
+	s.PatchValue(&getCurrentStatus, func(session mgoSession) (*Status, error) {
+		member := MemberStatus{
+			Id:      1,
+			Healthy: false,
+			State:   DownState,
+		}
+		statusCalls++
+		if statusCalls > 1 {
+			// The member has recovered by the second sample.
+			member.Healthy = true
+			member.State = SecondaryState
+		}
+		return &Status{
+			Name: "test",
+			Members: []MemberStatus{{
+				Id:      666,
+				Healthy: true,
+				State:   PrimaryState,
+			}, member},
+		}, nil
+	})
+
+	s.current = []Member{{
+		Id:      1,
+		Address: "10.0.0.1",
+	}, {
+		Id:      666,
+		Address: "10.0.0.2",
+	}}
+	m := &mockSession{}
+	wantMembers := []Member{{
+		Id:      666,
+		Address: "10.0.0.2",
+	}}
+	err := Set(m, wantMembers)
+	c.Assert(err, gc.ErrorMatches, "cannot remove member 1 from replicaset: repair needed")
+	c.Assert(m.cfg, gc.IsNil)
+	c.Assert(m.repaired, jc.IsFalse)
+	c.Assert(statusCalls, gc.Equals, 2)
+}
+
+// patchConfigFromSession makes getCurrentConfig reflect the last reconfig
+// applied to the mock session, so a post-repair retry sees the repaired
+// config rather than the initial one.
+func (s *changesSuite) patchConfigFromSession(c *gc.C, m *mockSession) {
+	s.PatchValue(&getCurrentConfig, func(session mgoSession) (*Config, error) {
+		if m.cfg == nil {
+			return &Config{
+				Members: append([]Member(nil), s.current...),
+			}, nil
+		}
+		cfg := *m.cfg
+		cfg.Members = append([]Member(nil), m.cfg.Members...)
+		return &cfg, nil
+	})
+}
+
+func (s *changesSuite) setupRepairStatus(c *gc.C) {
+	mockCurentStatus := func(session mgoSession) (*Status, error) {
+		return &Status{
+			Name: "test",
+			Members: []MemberStatus{{
+				Id:    666,
+				State: PrimaryState,
+			}, {
+				Id:      1,
+				Healthy: false,
+				State:   DownState,
+			}},
+		}, nil
+	}
+	s.PatchValue(&getCurrentStatus, mockCurentStatus)
 }
 
 type fmtConfigForLogSuite struct {
