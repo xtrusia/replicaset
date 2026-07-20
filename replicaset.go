@@ -252,14 +252,19 @@ func applyReplSetConfigChanges(cmd string, session mgoSession, currentConfig *Co
 		// A quorum-check failure can happen during update, add, or remove when a
 		// member being removed is down. Repair once by forcing out confirmed-dead
 		// removed members, then retry against the refreshed config.
-		if err := repairReplicaSet(session, removed); err != nil {
-			return errors.Annotatef(err, "repairing replicaset")
+		if repairErr := repairReplicaSet(session, removed); repairErr != nil {
+			return errors.Annotatef(repairErr, "repairing replicaset after %q", err)
 		}
 		repairedConfig, err := getCurrentConfig(session)
 		if err != nil {
 			return err
 		}
-		return doReplSetConfigChanges(cmd, session, repairedConfig, updated, added, removed)
+		err = doReplSetConfigChanges(cmd, session, repairedConfig, updated, added, removed)
+		if errors.Is(err, repairNeeded) {
+			// %v, not Annotatef: don't expose the repairNeeded sentinel to callers.
+			return errors.Errorf("cannot apply %s changes after repairing replicaset: %v", cmd, err)
+		}
+		return err
 	}
 	return err
 }
@@ -377,7 +382,7 @@ var repairNeeded = errors.ConstError("repair needed")
 func applyReplSetConfig(cmd string, session mgoSession, newConfig Config) error {
 	err := session.Run(bson.D{{"replSetReconfig", newConfig}}, nil)
 	if isQuorumCheckFailure(err) {
-		return repairNeeded
+		return fmt.Errorf("%w: %v", repairNeeded, err)
 	}
 	if err == io.EOF {
 		// If the primary changes due to replSetReconfig, then all
@@ -413,9 +418,15 @@ func isQuorumCheckFailure(err error) bool {
 	return qe.Code == 11602 || strings.Contains(qe.Message, "Quorum check failed")
 }
 
-// repairReplicaSet will remove any unhealthy nodes that are in the
-// removed list and then force a remaining secondary to become a primary.
+// repairReplicaSet removes explicit targets that remain unhealthy and report
+// DOWN or UNKNOWN, then forces a remaining secondary to become a primary.
 func repairReplicaSet(session mgoSession, removed []int) error {
+	if len(removed) == 0 {
+		// Quorum was lost without us asking to remove anything, so there is no
+		// member we are allowed to force out.
+		return errors.Errorf("cannot repair replicaset: no removal targets")
+	}
+
 	cfg, err := getCurrentConfig(session)
 	if err != nil {
 		return errors.Annotatef(err, "getting rs config to repair")
@@ -423,28 +434,20 @@ func repairReplicaSet(session mgoSession, removed []int) error {
 
 	removedIds := set.NewInts(removed...)
 
-	// Only force out members we were asked to remove that are confirmed dead
-	// (see confirmDeadMembers), so a transient blip can't evict a live node.
-	dead, unhealthy, err := confirmDeadMembers(session, removedIds)
+	// A forced reconfig skips the quorum check mongo would normally run, so
+	// decide first whether forcing is safe at all (see assessRepairSafety).
+	assessment, err := assessRepairSafety(session, cfg, removedIds)
 	if err != nil {
 		return err
 	}
-	if dead.Size() == 0 {
-		if unhealthy.Size() > 0 {
-			// Unhealthy members exist but none is one we're removing:
-			// ambiguous, so refuse to force.
-			return errors.Errorf(
-				"cannot repair replicaset: unhealthy members %v, none in removed ids %v was confirmed dead",
-				unhealthy.SortedValues(), removedIds.SortedValues())
-		}
-		// Nothing dead to remove; let the caller re-drive the reconfig.
-		return nil
+	if !assessment.safe {
+		return errors.Errorf("cannot repair replicaset: %s", assessment.reason)
 	}
 
 	cfg.Version++
 	var remaining []Member
 	for _, m := range cfg.Members {
-		if dead.Contains(m.Id) {
+		if assessment.evict.Contains(m.Id) {
 			continue
 		}
 		remaining = append(remaining, m)
@@ -458,69 +461,147 @@ func repairReplicaSet(session mgoSession, removed []int) error {
 		return errors.Annotatef(err, "repairing rs")
 	}
 	logger.Infof("replicaset repair done, waiting for new primary")
-	// Poll 5 times.
-	backoffms := 1000.0
-gotprimary:
-	for i := 0; i < 5; i++ {
+	backoff := primaryPollInterval
+	for i := 0; i < primaryPollAttempts; i++ {
 		status, err := getCurrentStatus(session)
 		if err != nil {
 			return errors.Annotatef(err, "checking rs status to repair")
 		}
 		for _, m := range status.Members {
 			if m.State == PrimaryState {
-				break gotprimary
+				return nil
 			}
 		}
 		logger.Debugf("still waiting for primary...")
-		time.Sleep(time.Duration(backoffms) * time.Millisecond)
-		backoffms *= 1.2
+		if i+1 < primaryPollAttempts {
+			time.Sleep(backoff)
+			backoff = time.Duration(float64(backoff) * 1.2)
+		}
 	}
-	return nil
+	return errors.Errorf("cannot repair replicaset: no primary elected after %d attempts", primaryPollAttempts)
 }
 
-// confirmDeadSamples and confirmDeadInterval control how confirmDeadMembers
-// re-samples the replicaset status. Variables so tests can patch them.
+const primaryPollAttempts = 5
+
+// The intervals are variables so tests can avoid sleeping.
 var (
 	confirmDeadSamples  = 3
 	confirmDeadInterval = 2 * time.Second
+	primaryPollInterval = time.Second
 )
 
-// confirmDeadMembers re-samples the replicaset status to decide which of the
-// wanted members are genuinely dead. A member is treated as dead only if it is
-// unhealthy AND reports DOWN in every sample, so a transient health blip cannot
-// trigger a forced removal. unhealthy holds the ids of members that were
-// unhealthy in the last sample taken, so the caller can report them.
-func confirmDeadMembers(session mgoSession, want set.Ints) (dead set.Ints, unhealthy set.Ints, err error) {
-	dead = set.NewInts()
-	unhealthy = set.NewInts()
+// repairSafetyAssessment says whether a forced reconfig is safe, and which
+// members it may evict. When it is not safe, reason explains why.
+type repairSafetyAssessment struct {
+	safe   bool
+	reason string
+	evict  set.Ints
+}
+
+// assessRepairSafety re-samples the replicaset status before a forced reconfig.
+// A targeted member is evictable only when it is unhealthy and reports DOWN or
+// UNKNOWN in every sample. It does not count as healthy for majority.
+// Repair is refused if no member qualifies, an untargeted voter is unhealthy in
+// every sample, the consistently healthy remaining voters lack a majority, or
+// none of those voters can become primary.
+func assessRepairSafety(session mgoSession, cfg *Config, removed set.Ints) (*repairSafetyAssessment, error) {
+	// Voting members form the election majority, while only data-bearing voters
+	// with positive priority can become primary.
+	voting := set.NewInts()
+	primaryEligible := set.NewInts()
+	for _, m := range cfg.Members {
+		if hasVote(m) {
+			voting.Add(m.Id)
+		}
+		if canBecomePrimary(m) {
+			primaryEligible.Add(m.Id)
+		}
+	}
+
+	var deadRemoved, liveVoting, livePrimaryEligible, unhealthyOtherVoting set.Ints
 	for i := 0; i < confirmDeadSamples; i++ {
 		if i > 0 {
 			time.Sleep(confirmDeadInterval)
 		}
 		status, err := getCurrentStatus(session)
 		if err != nil {
-			return set.NewInts(), set.NewInts(), errors.Annotatef(err, "getting rs status to confirm dead members")
+			return nil, errors.Annotatef(err, "getting rs status to assess repair safety")
 		}
-		downNow := set.NewInts()
-		unhealthy = set.NewInts()
+
+		deadRemovedNow := set.NewInts()
+		liveVotingNow := set.NewInts()
+		livePrimaryEligibleNow := set.NewInts()
+		unhealthyOtherVotingNow := set.NewInts()
 		for _, m := range status.Members {
-			if !m.Healthy {
-				unhealthy.Add(m.Id)
+			if m.Healthy {
+				if voting.Contains(m.Id) {
+					liveVotingNow.Add(m.Id)
+				}
+				if primaryEligible.Contains(m.Id) && (m.State == PrimaryState || m.State == SecondaryState) {
+					livePrimaryEligibleNow.Add(m.Id)
+				}
+				continue
 			}
-			if want.Contains(m.Id) && !m.Healthy && m.State == DownState {
-				downNow.Add(m.Id)
+			if removed.Contains(m.Id) && (m.State == DownState || m.State == UnknownState) {
+				deadRemovedNow.Add(m.Id)
+			}
+			if !voting.Contains(m.Id) {
+				continue
+			}
+			if !removed.Contains(m.Id) {
+				unhealthyOtherVotingNow.Add(m.Id)
 			}
 		}
+
 		if i == 0 {
-			dead = downNow
+			deadRemoved, liveVoting, livePrimaryEligible, unhealthyOtherVoting =
+				deadRemovedNow, liveVotingNow, livePrimaryEligibleNow, unhealthyOtherVotingNow
 		} else {
-			dead = dead.Intersection(downNow)
+			deadRemoved = deadRemoved.Intersection(deadRemovedNow)
+			liveVoting = liveVoting.Intersection(liveVotingNow)
+			livePrimaryEligible = livePrimaryEligible.Intersection(livePrimaryEligibleNow)
+			unhealthyOtherVoting = unhealthyOtherVoting.Intersection(unhealthyOtherVotingNow)
 		}
-		if dead.Size() == 0 {
-			return dead, unhealthy, nil
+		if deadRemoved.Size() == 0 {
+			// Nothing left to evict, so more samples cannot change the outcome.
+			break
 		}
 	}
-	return dead, unhealthy, nil
+
+	if deadRemoved.Size() == 0 {
+		return &repairSafetyAssessment{
+			reason: fmt.Sprintf("no member of %v remained DOWN or UNKNOWN across all samples, the replicaset may have recovered",
+				removed.SortedValues()),
+		}, nil
+	}
+	if unhealthyOtherVoting.Size() > 0 {
+		// Members we were not asked to remove are also unhealthy, so we cannot
+		// tell this apart from a wider outage.
+		return &repairSafetyAssessment{
+			reason: fmt.Sprintf("voters %v are unhealthy but not in the removal targets %v",
+				unhealthyOtherVoting.SortedValues(), removed.SortedValues()),
+		}, nil
+	}
+
+	// The eviction must leave enough live voters to elect a primary.
+	evictVoting := deadRemoved.Intersection(voting)
+	remainingVoters := voting.Difference(evictVoting)
+	liveVoters := liveVoting.Difference(evictVoting)
+	needed := (remainingVoters.Size() / 2) + 1
+	if liveVoters.Size() < needed {
+		return &repairSafetyAssessment{
+			reason: fmt.Sprintf("evicting %v leaves live voters %v of %v, but a majority needs %d",
+				evictVoting.SortedValues(), liveVoters.SortedValues(), remainingVoters.SortedValues(), needed),
+		}, nil
+	}
+	if livePrimaryEligible.Size() == 0 {
+		return &repairSafetyAssessment{
+			reason: fmt.Sprintf("evicting %v leaves no live primary-eligible member among voters %v",
+				deadRemoved.SortedValues(), remainingVoters.SortedValues()),
+		}, nil
+	}
+
+	return &repairSafetyAssessment{safe: true, evict: deadRemoved}, nil
 }
 
 var localHostIpv4 = regexp.MustCompile(`127\.0\.0\.\d+`)
@@ -605,6 +686,13 @@ func findMaxId(oldMembers, newMembers []Member) int {
 
 func hasVote(m Member) bool {
 	return m.Votes == nil || *m.Votes > 0
+}
+
+func canBecomePrimary(m Member) bool {
+	if !hasVote(m) || (m.Arbiter != nil && *m.Arbiter) {
+		return false
+	}
+	return m.Priority == nil || *m.Priority > 0
 }
 
 // Set changes the current set of replica set members.  Members will have their
