@@ -251,7 +251,9 @@ func applyReplSetConfigChanges(cmd string, session mgoSession, currentConfig *Co
 	if errors.Is(err, repairNeeded) {
 		// A quorum-check failure can happen during update, add, or remove when a
 		// member being removed is down. Repair once by forcing out confirmed-dead
-		// removed members, then retry against the refreshed config.
+		// removed members, then retry against the refreshed config with a
+		// normal reconfig. If no member needs forcing out, nothing is forced
+		// first.
 		if repairErr := repairReplicaSet(session, removed); repairErr != nil {
 			return errors.Annotatef(repairErr, "repairing replicaset after %q", err)
 		}
@@ -262,7 +264,7 @@ func applyReplSetConfigChanges(cmd string, session mgoSession, currentConfig *Co
 		err = doReplSetConfigChanges(cmd, session, repairedConfig, updated, added, removed)
 		if errors.Is(err, repairNeeded) {
 			// %v, not Annotatef: don't expose the repairNeeded sentinel to callers.
-			return errors.Errorf("cannot apply %s changes after repairing replicaset: %v", cmd, err)
+			return errors.Errorf("cannot apply %s changes after replicaset repair attempt: %v", cmd, err)
 		}
 		return err
 	}
@@ -271,7 +273,7 @@ func applyReplSetConfigChanges(cmd string, session mgoSession, currentConfig *Co
 
 // doReplSetConfigChanges applies the updates, adds and removes one change at a
 // time. Any step whose reconfig loses quorum returns repairNeeded so the caller
-// can force-remove the dead member and retry.
+// can force-remove a dead member, if there is one, and retry.
 func doReplSetConfigChanges(cmd string, session mgoSession, currentConfig *Config, updated []Member, added []Member, removed []int) error {
 	logger.Debugf("%s() changing replica set\n%s\n- updated:\n%#v\n- added:\n%s\n- removed: %v",
 		cmd, fmtConfigForLog(currentConfig), fmtUpdatedMembersForLog(updated), fmtMembersForLog(added), removed)
@@ -419,7 +421,10 @@ func isQuorumCheckFailure(err error) bool {
 }
 
 // repairReplicaSet removes explicit targets that remain unhealthy and report
-// DOWN or UNKNOWN, then forces a remaining secondary to become a primary.
+// DOWN or UNKNOWN with a forced reconfig, then waits for a primary to be
+// elected. When no target stays unavailable and nothing else blocks the
+// repair, it forces nothing and only waits for a primary, so the caller
+// retries the change with a normal, quorum-checked reconfig.
 func repairReplicaSet(session mgoSession, removed []int) error {
 	if len(removed) == 0 {
 		// Quorum was lost without us asking to remove anything, so there is no
@@ -443,24 +448,32 @@ func repairReplicaSet(session mgoSession, removed []int) error {
 	if !assessment.safe {
 		return errors.Errorf("cannot repair replicaset: %s", assessment.reason)
 	}
-
-	cfg.Version++
-	var remaining []Member
-	for _, m := range cfg.Members {
-		if assessment.evict.Contains(m.Id) {
-			continue
+	if assessment.evict.Size() == 0 {
+		// No target stayed DOWN or UNKNOWN, so the quorum failure may be
+		// transient. Forcing would skip the mongo quorum check, so leave the
+		// retry to a normal reconfig instead. The primary may have stepped
+		// down, so still wait for one before the caller retries.
+		logger.Infof("no member of %v in the current config remained DOWN or UNKNOWN, waiting for a primary before retrying without a forced reconfig",
+			removedIds.SortedValues())
+	} else {
+		cfg.Version++
+		var remaining []Member
+		for _, m := range cfg.Members {
+			if assessment.evict.Contains(m.Id) {
+				continue
+			}
+			remaining = append(remaining, m)
 		}
-		remaining = append(remaining, m)
+		cfg.Members = remaining
+		err = session.Run(bson.D{
+			{"replSetReconfig", *cfg},
+			{"force", "true"},
+		}, nil)
+		if err != nil {
+			return errors.Annotatef(err, "repairing rs")
+		}
+		logger.Infof("replicaset repair done, waiting for new primary")
 	}
-	cfg.Members = remaining
-	err = session.Run(bson.D{
-		{"replSetReconfig", *cfg},
-		{"force", "true"},
-	}, nil)
-	if err != nil {
-		return errors.Annotatef(err, "repairing rs")
-	}
-	logger.Infof("replicaset repair done, waiting for new primary")
 	backoff := primaryPollInterval
 	for i := 0; i < primaryPollAttempts; i++ {
 		status, err := getCurrentStatus(session)
@@ -469,6 +482,10 @@ func repairReplicaSet(session mgoSession, removed []int) error {
 		}
 		for _, m := range status.Members {
 			if m.State == PrimaryState {
+				// The primary may have changed, so release the session's
+				// socket to the old one and let the retry pick a socket
+				// again.
+				session.Refresh()
 				return nil
 			}
 		}
@@ -481,35 +498,49 @@ func repairReplicaSet(session mgoSession, removed []int) error {
 	return errors.Errorf("cannot repair replicaset: no primary elected after %d attempts", primaryPollAttempts)
 }
 
-const primaryPollAttempts = 5
+const (
+	// confirmDeadSamples is how many status samples assessRepairSafety takes.
+	confirmDeadSamples = 3
 
-// The intervals are variables so tests can avoid sleeping.
+	// About 16.5s in total (1s growing 1.2x over 8 sleeps), longer than
+	// mongo's default 10s election timeout.
+	primaryPollAttempts = 9
+)
+
+// These are variables, not constants, so tests can patch them to zero and
+// avoid sleeping.
 var (
-	confirmDeadSamples  = 3
 	confirmDeadInterval = 2 * time.Second
 	primaryPollInterval = time.Second
 )
 
-// repairSafetyAssessment says whether a forced reconfig is safe, and which
-// members it may evict. When it is not safe, reason explains why.
+// repairSafetyAssessment says whether the repair may proceed, and which
+// members it may force out. When it may not, reason explains why. With
+// nothing to evict, proceeding means only a normal retry, not a forced
+// reconfig.
 type repairSafetyAssessment struct {
 	safe   bool
 	reason string
 	evict  set.Ints
 }
 
-// assessRepairSafety re-samples the replicaset status before a forced reconfig.
-// A targeted member is evictable only when it is unhealthy and reports DOWN or
-// UNKNOWN in every sample. It does not count as healthy for majority.
-// Repair is refused if no member qualifies, an untargeted voter is unhealthy in
-// every sample, the consistently healthy remaining voters lack a majority, or
-// none of those voters can become primary.
+// assessRepairSafety re-samples the replicaset status to decide whether a
+// forced reconfig is needed and safe.
+// Only members in cfg are considered. A targeted member is evictable only when
+// it is unhealthy and reports DOWN or UNKNOWN in every sample. It does not
+// count as healthy for majority.
+// Repair is refused if an untargeted voter is unhealthy in every sample. If
+// no target qualifies, the repair is then safe with nothing to evict.
+// Otherwise it is also refused if the consistently healthy remaining voters
+// lack a majority, or none of those voters can become primary.
 func assessRepairSafety(session mgoSession, cfg *Config, removed set.Ints) (*repairSafetyAssessment, error) {
 	// Voting members form the election majority, while only data-bearing voters
 	// with positive priority can become primary.
+	members := set.NewInts()
 	voting := set.NewInts()
 	primaryEligible := set.NewInts()
 	for _, m := range cfg.Members {
+		members.Add(m.Id)
 		if hasVote(m) {
 			voting.Add(m.Id)
 		}
@@ -533,6 +564,11 @@ func assessRepairSafety(session mgoSession, cfg *Config, removed set.Ints) (*rep
 		livePrimaryEligibleNow := set.NewInts()
 		unhealthyOtherVotingNow := set.NewInts()
 		for _, m := range status.Members {
+			// The status can list a member that the config we are about to
+			// force no longer has, so ignore it rather than act on it.
+			if !members.Contains(m.Id) {
+				continue
+			}
 			if m.Healthy {
 				if voting.Contains(m.Id) {
 					liveVotingNow.Add(m.Id)
@@ -562,18 +598,15 @@ func assessRepairSafety(session mgoSession, cfg *Config, removed set.Ints) (*rep
 			livePrimaryEligible = livePrimaryEligible.Intersection(livePrimaryEligibleNow)
 			unhealthyOtherVoting = unhealthyOtherVoting.Intersection(unhealthyOtherVotingNow)
 		}
-		if deadRemoved.Size() == 0 {
-			// Nothing left to evict, so more samples cannot change the outcome.
+		if deadRemoved.Size() == 0 && unhealthyOtherVoting.Size() == 0 {
+			// Nothing left to evict or to block on, so more samples cannot
+			// change the outcome.
 			break
 		}
 	}
 
-	if deadRemoved.Size() == 0 {
-		return &repairSafetyAssessment{
-			reason: fmt.Sprintf("no member of %v remained DOWN or UNKNOWN across all samples, the replicaset may have recovered",
-				removed.SortedValues()),
-		}, nil
-	}
+	// Check the untargeted voters first, so a persistently down voter is
+	// reported even when every target has recovered.
 	if unhealthyOtherVoting.Size() > 0 {
 		// Members we were not asked to remove are also unhealthy, so we cannot
 		// tell this apart from a wider outage.
@@ -581,6 +614,9 @@ func assessRepairSafety(session mgoSession, cfg *Config, removed set.Ints) (*rep
 			reason: fmt.Sprintf("voters %v are unhealthy but not in the removal targets %v",
 				unhealthyOtherVoting.SortedValues(), removed.SortedValues()),
 		}, nil
+	}
+	if deadRemoved.Size() == 0 {
+		return &repairSafetyAssessment{safe: true, evict: deadRemoved}, nil
 	}
 
 	// The eviction must leave enough live voters to elect a primary.
@@ -620,7 +656,9 @@ func sameAddress(a, b string) bool {
 // Add adds the given members to the session's replica set.  Duplicates of
 // existing replicas will be ignored.
 //
-// Members will have their Ids set automatically if they are not already > 0
+// Members will have their Ids set automatically if they are not already > 0.
+// Add removes no members, so if a reconfig loses quorum it returns an error
+// rather than force-removing anything.
 func Add(session mgoSession, members ...Member) error {
 	config, err := getCurrentConfig(session)
 	if err != nil {
@@ -650,6 +688,9 @@ outerLoop:
 
 // Remove removes members with the given addresses from the replica set. It is
 // not an error to remove addresses of non-existent replica set members.
+// If a reconfig loses quorum, members being removed that stay DOWN or UNKNOWN
+// may be force-removed and, unless the repair is refused, the change is
+// retried once.
 func Remove(session mgoSession, addrs ...string) error {
 	config, err := getCurrentConfig(session)
 	if err != nil {
@@ -697,6 +738,9 @@ func canBecomePrimary(m Member) bool {
 
 // Set changes the current set of replica set members.  Members will have their
 // ids set automatically if their ids are not already > 0.
+// If a reconfig loses quorum, members being removed that stay DOWN or UNKNOWN
+// may be force-removed and, unless the repair is refused, the change is
+// retried once.
 func Set(session mgoSession, members []Member) error {
 	config, err := getCurrentConfig(session)
 	if err != nil {
