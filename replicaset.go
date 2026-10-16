@@ -1039,14 +1039,14 @@ func StepDownPrimary(session mgoSession) error {
 	strictSession := session.Clone()
 	defer strictSession.Close()
 	// StepDown can only be called on the primary
-	session.SetMode(mgo.Primary, true)
+	strictSession.SetMode(mgo.Primary, true)
 	// replSetStepDown takes a few optional parameters that vary based on what
 	// version of Mongo is running. In Mongo 2.4 it just takes the "step down
 	// seconds" which claims to default to 60s.
 	// In 3.2 it can also take secondaryCatchUpPeriodSecs which is supposed to
 	// start at 10s. However, testing shows that not passing either gives:
 	// err{"stepdown period must be longer than secondaryCatchUpPeriodSecs"}
-	err := session.Run(bson.D{{"replSetStepDown", 60.0}}, nil)
+	err := strictSession.Run(bson.D{{"replSetStepDown", 60.0}}, nil)
 	// we expect to get io.EOF so don't treat it as a failure.
 	if err == io.EOF {
 		return nil
@@ -1064,7 +1064,7 @@ func CurrentStatus(session mgoSession) (*Status, error) {
 	status := &Status{}
 	err := session.Run("replSetGetStatus", status)
 	if err != nil {
-		return nil, fmt.Errorf("cannot get replica set status: %v", err)
+		return nil, errors.Annotate(err, "cannot get replica set status")
 	}
 
 	for index, member := range status.Members {

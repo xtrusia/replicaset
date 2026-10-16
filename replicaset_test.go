@@ -478,17 +478,31 @@ func (s *MongoSuite) TestIsReadyMinority(c *gc.C) {
 	c.Check(ready, jc.IsFalse)
 }
 
+type statusErrorSession struct {
+	mgoSession
+	err       error
+	refreshes int
+}
+
+func (s *statusErrorSession) Run(cmd interface{}, result interface{}) error {
+	return s.err
+}
+
+func (s *statusErrorSession) Refresh() {
+	s.refreshes++
+	s.mgoSession.Refresh()
+}
+
 func (s *MongoSuite) checkConnectionFailure(c *gc.C, failure error) {
-	s.PatchValue(&getCurrentStatus,
-		func(session mgoSession) (*Status, error) { return nil, failure },
-	)
 	session := s.root.MustDial()
 	defer session.Close()
 
-	ready, err := IsReady(session)
+	failedSession := &statusErrorSession{mgoSession: session, err: failure}
+	ready, err := IsReady(failedSession)
 	c.Assert(err, jc.ErrorIsNil)
 
 	c.Check(ready, jc.IsFalse)
+	c.Check(failedSession.refreshes, gc.Equals, 1)
 }
 
 func (s *MongoSuite) TestIsReadyConnectionDropped(c *gc.C) {
@@ -504,14 +518,13 @@ func (s *MongoSuite) TestIsReadyConnectionFailedWithErrno(c *gc.C) {
 
 func (s *MongoSuite) TestIsReadyError(c *gc.C) {
 	failure := errors.New("failed!")
-	s.PatchValue(&getCurrentStatus,
-		func(session mgoSession) (*Status, error) { return nil, failure },
-	)
 	session := s.root.MustDial()
 	defer session.Close()
 
-	_, err := IsReady(session)
+	failedSession := &statusErrorSession{mgoSession: session, err: failure}
+	_, err := IsReady(failedSession)
 	c.Check(errors.Cause(err), gc.Equals, failure)
+	c.Check(failedSession.refreshes, gc.Equals, 0)
 }
 
 func (s *MongoSuite) TestWaitUntilReady(c *gc.C) {
@@ -721,8 +734,11 @@ func (s *MongoSuite) TestStepDownPrimary(c *gc.C) {
 		return nil
 	})
 	// Now that the secondaries are up, we should be able to ask the primary to step down and notice that the primary changes
+	session.SetMode(mgo.Monotonic, true)
+	mode := session.Mode()
 	err = StepDownPrimary(session)
 	c.Assert(err, jc.ErrorIsNil)
+	c.Check(session.Mode(), gc.Equals, mode)
 	// Changing the primary should cause us to get disconnected, so we need to reconnect
 	session.Close()
 	session = nil
