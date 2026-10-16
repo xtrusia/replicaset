@@ -8,7 +8,8 @@ package replicaset
 import (
 	"fmt"
 	"io"
-	"regexp"
+	"net"
+	"net/netip"
 	"sort"
 	"strings"
 	"syscall"
@@ -438,13 +439,41 @@ gotprimary:
 	return nil
 }
 
-var localHostIpv4 = regexp.MustCompile(`127\.0\.0\.\d+`)
+func sameAddress(a, b string) bool {
+	if a == b {
+		return true
+	}
+	ha, pa, err := splitAddress(a)
+	if err != nil {
+		return false
+	}
+	hb, pb, err := splitAddress(b)
+	if err != nil {
+		return false
+	}
+	if pa != pb {
+		return false
+	}
+	ipA, errA := netip.ParseAddr(ha)
+	ipB, errB := netip.ParseAddr(hb)
+	if errA == nil && errB == nil {
+		// Distinct loopback IPs can host different servers on the same port.
+		return ipA.Unmap() == ipB.Unmap()
+	}
+	return ha == hb
+}
 
-func isLocalhost(addr string) bool {
-	return addr == "::1" ||
-		addr == "0:0:0:0:0:0:0:1" ||
-		localHostIpv4.MatchString(addr) ||
-		addr == "localhost"
+// splitAddress splits addr into host and port. MongoDB reads an address
+// without a port as port 27017. SplitHostPort rejects a bare IPv6 address
+// even with a port added, so a bare IP address is taken as the host.
+func splitAddress(addr string) (string, string, error) {
+	if host, port, err := net.SplitHostPort(addr); err == nil {
+		return host, port, nil
+	}
+	if _, err := netip.ParseAddr(addr); err == nil {
+		return addr, "27017", nil
+	}
+	return net.SplitHostPort(addr + ":27017")
 }
 
 // Add adds the given members to the session's replica set.  Duplicates of
@@ -463,8 +492,7 @@ func Add(session mgoSession, members ...Member) error {
 outerLoop:
 	for _, newMember := range members {
 		for _, member := range config.Members {
-			if member.Address == newMember.Address ||
-				isLocalhost(member.Address) && isLocalhost(newMember.Address) {
+			if sameAddress(member.Address, newMember.Address) {
 				// already exists, skip it
 				continue outerLoop
 			}
@@ -489,8 +517,7 @@ func Remove(session mgoSession, addrs ...string) error {
 	var toRemove []int
 	for _, rem := range addrs {
 		for _, repl := range config.Members {
-			if repl.Address == rem ||
-				isLocalhost(repl.Address) && isLocalhost(rem) {
+			if sameAddress(repl.Address, rem) {
 				toRemove = append(toRemove, repl.Id)
 				break
 			}
@@ -552,9 +579,35 @@ func Set(session mgoSession, members []Member) error {
 		votes   = 1
 	)
 	updatedIds := set.NewInts()
+	// An existing member that moves to another address frees its old one.
 	for _, m := range members {
-		existingMember, ok := existingMembers[m.Id]
-		if ok {
+		if existing, ok := existingMembers[m.Id]; ok && m.Id > 0 && existing.Address != m.Address {
+			delete(existingAddressIds, existing.Address)
+		}
+	}
+	for _, m := range members {
+		// A wanted member at an existing address updates that member in
+		// place, reusing its Id, rather than adding a duplicate host.
+		id, ok := existingAddressIds[m.Address]
+		// Otherwise take the first existing address that sameAddress matches.
+		if !ok {
+			for _, e := range config.Members {
+				if _, left := existingAddressIds[e.Address]; left && sameAddress(e.Address, m.Address) {
+					id, ok = e.Id, true
+					break
+				}
+			}
+		}
+		if ok && m.Id != id {
+			if m.Id > 0 {
+				return fmt.Errorf("cannot set member %d: address %q already used by member %d", m.Id, m.Address, id)
+			}
+			m.Id = id
+		}
+		// A member given without an Id has Id 0, so it is member 0 only
+		// when its address matched member 0.
+		existingMember, exists := existingMembers[m.Id]
+		if exists && (ok || m.Id > 0) {
 			if existingMember.Address != m.Address || hasVote(existingMember) != hasVote(m) {
 				updatedIds.Add(m.Id)
 				updated = append(updated, m)

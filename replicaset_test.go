@@ -810,6 +810,7 @@ func (m *mockSession) Run(cmd interface{}, _ interface{}) error {
 	if !m.repaired && len(cfg.Members) == 1 && cfg.Members[0].Id == 666 {
 		return &mgo.QueryError{Code: 11602}
 	}
+	cfg.Members = append([]Member(nil), cfg.Members...)
 	m.cfg = &cfg
 	return nil
 }
@@ -828,7 +829,7 @@ var _ = gc.Suite(&changesSuite{})
 func (s *changesSuite) SetUpTest(c *gc.C) {
 	s.PatchValue(&getCurrentConfig, func(session mgoSession) (*Config, error) {
 		return &Config{
-			Members: s.current,
+			Members: append([]Member(nil), s.current...),
 		}, nil
 	})
 }
@@ -951,6 +952,305 @@ func (s *changesSuite) TestSetUpdateVote(c *gc.C) {
 	})
 }
 
+func (s *changesSuite) TestSetUpdatesMemberAtExistingAddress(c *gc.C) {
+	s.current = []Member{{
+		Id:       4,
+		Address:  "10.0.0.2",
+		Priority: &one,
+		Votes:    &votes,
+	}, {
+		Id:       5,
+		Address:  "10.0.0.3",
+		Priority: &one,
+		Votes:    &votes,
+	}}
+	m := &mockSession{}
+	wantMembers := []Member{{
+		Id:       5,
+		Address:  "10.0.0.3",
+		Priority: &one,
+		Votes:    &votes,
+	}, {
+		// No Id: the member already at this address must be updated,
+		// not added again.
+		Address: "10.0.0.2",
+		Votes:   &novotes,
+	}}
+	err := Set(m, wantMembers)
+	c.Assert(err, jc.ErrorIsNil)
+	c.Assert(m.cfg, jc.DeepEquals, &Config{
+		Version: 1,
+		Members: []Member{{
+			Id:      4,
+			Address: "10.0.0.2",
+			Votes:   &novotes,
+		}, {
+			Id:       5,
+			Address:  "10.0.0.3",
+			Priority: &one,
+			Votes:    &votes,
+		}},
+	})
+}
+
+func (s *changesSuite) TestSetNoChangesForMemberAtExistingAddress(c *gc.C) {
+	s.current = []Member{{
+		Id:      1,
+		Address: "10.0.0.1",
+	}}
+	m := &mockSession{}
+	wantMembers := []Member{{
+		Address: "10.0.0.1",
+	}}
+	err := Set(m, wantMembers)
+	c.Assert(err, jc.ErrorIsNil)
+	c.Assert(m.cfg, gc.IsNil)
+}
+
+func (s *changesSuite) TestSetErrorsForOtherIdAtExistingAddress(c *gc.C) {
+	s.current = []Member{{
+		Id:      4,
+		Address: "10.0.0.2",
+	}}
+	m := &mockSession{}
+	wantMembers := []Member{{
+		Id:      6,
+		Address: "10.0.0.2",
+	}}
+	err := Set(m, wantMembers)
+	c.Assert(err, gc.ErrorMatches, `cannot set member 6: address "10.0.0.2" already used by member 4`)
+	c.Assert(m.cfg, gc.IsNil)
+}
+
+func (s *changesSuite) TestSetAddsAtAddressOfMovedMember(c *gc.C) {
+	s.current = []Member{{
+		Id:      1,
+		Address: "10.0.0.1",
+	}, {
+		Id:      2,
+		Address: "10.0.0.2",
+	}}
+	m := &mockSession{}
+	wantMembers := []Member{{
+		Id:      1,
+		Address: "10.0.0.9",
+	}, {
+		Id:      2,
+		Address: "10.0.0.2",
+	}, {
+		// No Id: member 1 moves away, so its old address is free for a
+		// new member.
+		Address: "10.0.0.1",
+	}}
+	err := Set(m, wantMembers)
+	c.Assert(err, jc.ErrorIsNil)
+	c.Assert(m.cfg, jc.DeepEquals, &Config{
+		Version: 2,
+		Members: []Member{{
+			Id:      1,
+			Address: "10.0.0.9",
+		}, {
+			Id:      2,
+			Address: "10.0.0.2",
+		}, {
+			Id:       3,
+			Address:  "10.0.0.1",
+			Priority: &one,
+			Votes:    &votes,
+		}},
+	})
+}
+
+func (s *changesSuite) TestSetUpdatesMemberAtLocalhostAddress(c *gc.C) {
+	s.current = []Member{{
+		Id:      1,
+		Address: "127.0.0.1:37017",
+	}, {
+		Id:      2,
+		Address: "10.0.0.2:37017",
+	}}
+	m := &mockSession{}
+	wantMembers := []Member{{
+		Id:      1,
+		Address: "localhost:37017",
+	}, {
+		Id:      2,
+		Address: "10.0.0.2:37017",
+	}}
+	err := Set(m, wantMembers)
+	c.Assert(err, jc.ErrorIsNil)
+	c.Assert(m.cfg, jc.DeepEquals, &Config{
+		Version: 1,
+		Members: []Member{{
+			Id:      1,
+			Address: "localhost:37017",
+		}, {
+			Id:      2,
+			Address: "10.0.0.2:37017",
+		}},
+	})
+}
+
+func (s *changesSuite) TestSetRemovesMemberZeroWhenIdOmitted(c *gc.C) {
+	s.current = []Member{{
+		Id:      0,
+		Address: "10.0.0.1",
+	}, {
+		Id:      1,
+		Address: "10.0.0.2",
+	}}
+	m := &mockSession{}
+	// No Id: the wanted member is member 1 by address, so member 0 is
+	// no longer wanted and must be removed.
+	wantMembers := []Member{{
+		Address: "10.0.0.2",
+	}}
+	err := Set(m, wantMembers)
+	c.Assert(err, jc.ErrorIsNil)
+	c.Assert(m.cfg, jc.DeepEquals, &Config{
+		Version: 1,
+		Members: []Member{{
+			Id:      1,
+			Address: "10.0.0.2",
+		}},
+	})
+}
+
+func (s *changesSuite) TestSetAddsMembersWithoutIdBesideMemberZero(c *gc.C) {
+	s.current = []Member{{
+		Id:      0,
+		Address: "10.0.0.1",
+	}, {
+		Id:      1,
+		Address: "10.0.0.2",
+	}}
+	m := &mockSession{}
+	// The two members without an Id match no existing address, so both are
+	// new, and member 0 is no longer wanted.
+	err := Set(m, []Member{{
+		Id:      1,
+		Address: "10.0.0.2",
+	}, {
+		Address: "10.0.0.3",
+	}, {
+		Address: "10.0.0.4",
+	}})
+	c.Assert(err, jc.ErrorIsNil)
+	c.Assert(m.cfg, jc.DeepEquals, &Config{
+		Version: 3,
+		Members: []Member{{
+			Id:      1,
+			Address: "10.0.0.2",
+		}, {
+			Id:       2,
+			Address:  "10.0.0.3",
+			Priority: &one,
+			Votes:    &votes,
+		}, {
+			Id:       3,
+			Address:  "10.0.0.4",
+			Priority: &one,
+			Votes:    &votes,
+		}},
+	})
+}
+
+func (s *changesSuite) TestSetUpdatesMemberZeroWhenIdOmitted(c *gc.C) {
+	s.current = []Member{{
+		Id:      0,
+		Address: "10.0.0.1",
+	}, {
+		Id:      1,
+		Address: "10.0.0.2",
+	}}
+	m := &mockSession{}
+	// No Id, but the address is member 0's, so member 0 is updated.
+	err := Set(m, []Member{{
+		Address: "10.0.0.1",
+		Votes:   &novotes,
+	}, {
+		Id:      1,
+		Address: "10.0.0.2",
+	}})
+	c.Assert(err, jc.ErrorIsNil)
+	c.Assert(m.cfg, jc.DeepEquals, &Config{
+		Version: 1,
+		Members: []Member{{
+			Id:      0,
+			Address: "10.0.0.1",
+			Votes:   &novotes,
+		}, {
+			Id:      1,
+			Address: "10.0.0.2",
+		}},
+	})
+}
+
+func (s *changesSuite) TestSetSendsMembersAtTheSameAddress(c *gc.C) {
+	s.current = []Member{{
+		Id:      1,
+		Address: "10.0.0.1",
+	}}
+	m := &mockSession{}
+	// MongoDB rejects two members at one address. Set must send member 3
+	// rather than drop it.
+	err := Set(m, []Member{{
+		Id:      1,
+		Address: "10.0.0.1",
+	}, {
+		Id:      2,
+		Address: "10.0.0.2",
+	}, {
+		Id:      3,
+		Address: "10.0.0.2",
+	}})
+	c.Assert(err, jc.ErrorIsNil)
+	c.Assert(m.cfg, jc.DeepEquals, &Config{
+		Version: 2,
+		Members: []Member{{
+			Id:      1,
+			Address: "10.0.0.1",
+		}, {
+			Id:       2,
+			Address:  "10.0.0.2",
+			Priority: &one,
+			Votes:    &votes,
+		}, {
+			Id:       3,
+			Address:  "10.0.0.2",
+			Priority: &one,
+			Votes:    &votes,
+		}},
+	})
+}
+
+func (s *changesSuite) TestSetAddsLocalhostMemberOnAnotherPort(c *gc.C) {
+	s.current = []Member{{
+		Id:      1,
+		Address: "127.0.0.1:37017",
+	}}
+	m := &mockSession{}
+	err := Set(m, []Member{{
+		Id:      1,
+		Address: "127.0.0.1:37017",
+	}, {
+		Address: "127.0.0.1:37018",
+	}})
+	c.Assert(err, jc.ErrorIsNil)
+	c.Assert(m.cfg, jc.DeepEquals, &Config{
+		Version: 1,
+		Members: []Member{{
+			Id:      1,
+			Address: "127.0.0.1:37017",
+		}, {
+			Id:       2,
+			Address:  "127.0.0.1:37018",
+			Priority: &one,
+			Votes:    &votes,
+		}},
+	})
+}
+
 func (s *changesSuite) TestSetRemoves(c *gc.C) {
 	s.current = []Member{{
 		Id:      1,
@@ -1036,6 +1336,131 @@ func (s *changesSuite) TestRepair(c *gc.C) {
 		}},
 	})
 	c.Assert(m.repaired, jc.IsTrue)
+}
+
+func (s *changesSuite) TestChangesKeepDistinctLoopbackMembers(c *gc.C) {
+	members := []Member{
+		{Id: 1, Address: "127.0.0.1:37017"},
+		{Id: 2, Address: "127.1.0.1:37017"},
+		{Id: 3, Address: "127.2.0.1:37017"},
+	}
+	newMember := Member{Address: "127.3.0.1:37017"}
+	for _, test := range []struct {
+		name  string
+		apply func(mgoSession) error
+		ids   []int
+		addrs []string
+	}{{
+		name: "Add",
+		apply: func(session mgoSession) error {
+			return Add(session, newMember)
+		},
+		ids:   []int{1, 2, 3, 4},
+		addrs: []string{members[0].Address, members[1].Address, members[2].Address, newMember.Address},
+	}, {
+		name: "Set",
+		apply: func(session mgoSession) error {
+			wanted := append([]Member(nil), members...)
+			return Set(session, append(wanted, newMember))
+		},
+		ids:   []int{1, 2, 3, 4},
+		addrs: []string{members[0].Address, members[1].Address, members[2].Address, newMember.Address},
+	}, {
+		name: "Remove",
+		apply: func(session mgoSession) error {
+			return Remove(session, members[1].Address)
+		},
+		ids:   []int{1, 3},
+		addrs: []string{members[0].Address, members[2].Address},
+	}} {
+		c.Log(test.name)
+		s.current = members
+		m := &mockSession{}
+		c.Assert(test.apply(m), jc.ErrorIsNil)
+		if !c.Check(m.cfg, gc.NotNil) {
+			continue
+		}
+		var ids []int
+		var addrs []string
+		for _, member := range m.cfg.Members {
+			ids = append(ids, member.Id)
+			addrs = append(addrs, member.Address)
+		}
+		c.Check(ids, jc.DeepEquals, test.ids)
+		c.Check(addrs, jc.DeepEquals, test.addrs)
+		c.Check(m.repaired, jc.IsFalse)
+	}
+}
+
+func (s *changesSuite) TestChangesKeepLocalhostSeparate(c *gc.C) {
+	s.current = []Member{
+		{Id: 1, Address: "127.1.0.1:37017"},
+		{Id: 2, Address: "127.2.0.1:37017"},
+	}
+	local := Member{Id: 3, Address: "localhost:37017"}
+	m := &mockSession{}
+	c.Assert(Add(m, local), jc.ErrorIsNil)
+	c.Assert(m.cfg, gc.NotNil)
+	c.Check(m.cfg.Members, jc.DeepEquals, append(s.current, local))
+
+	m = &mockSession{}
+	c.Assert(Set(m, append(s.current, local)), jc.ErrorIsNil)
+	c.Assert(m.cfg, gc.NotNil)
+	c.Check(m.cfg.Members[2].Id, gc.Equals, local.Id)
+	c.Check(m.cfg.Members[2].Address, gc.Equals, local.Address)
+
+	s.current = []Member{s.current[0], local, s.current[1]}
+	m = &mockSession{}
+	c.Assert(Remove(m, local.Address), jc.ErrorIsNil)
+	c.Assert(m.cfg, gc.NotNil)
+	c.Check(m.cfg.Members, jc.DeepEquals, []Member{s.current[0], s.current[2]})
+	c.Check(m.repaired, jc.IsFalse)
+}
+
+func (s *changesSuite) TestRemoveDoesNotMatchUnknownLocalhost(c *gc.C) {
+	s.current = []Member{{Id: 1, Address: "127.0.0.1:37017"}}
+	m := &mockSession{}
+	c.Assert(Remove(m, "localhost:37017"), jc.ErrorIsNil)
+	c.Check(m.cfg, gc.IsNil)
+}
+
+func (s *changesSuite) TestSameAddress(c *gc.C) {
+	for i, test := range []struct {
+		a, b string
+		want bool
+	}{
+		{"127.0.0.1", "localhost", false},
+		{"127.0.0.1", "127.0.0.1:27017", true},
+		{"127.0.0.1", "127.0.0.1:37017", false},
+		{"localhost", "localhost:37017", false},
+		{"127.0.0.1:37017", "127.0.0.2:37017", false},
+		{"127.0.0.1:37017", "127.1.0.1:37017", false},
+		{"127.0.0.1:37017", "[::ffff:127.0.0.1]:37017", true},
+		{"127.0.0.1:37017", "[::ffff:127.1.0.1]:37017", false},
+		{"[::1]:37017", "[::ffff:127.0.0.1]:37017", false},
+		{"127.0.0.1:37017", "127.0.0.1:37018", false},
+		{"127.0.0.1:37017", "localhost:37017", false},
+		{"[::1]:37017", "127.0.0.1:37017", false},
+		{"127.1.2.3:37017", "localhost:37017", false},
+		{"127.0.0.1.example.com:37017", "localhost:37017", false},
+		{"[::1]", "localhost:27017", false},
+		{"[::1]", "localhost:37017", false},
+		{"[fd00::1]", "localhost", false},
+		{"10.0.0.3", "10.0.0.3:27017", true},
+		{"10.0.0.3", "10.0.0.3:37017", false},
+		{"10.0.0.3:37017", "10.0.0.4:37017", false},
+		{"[fd00::1]", "[fd00::1]:27017", true},
+		{"[fd00::1]", "[fd00::1]:37017", false},
+		{"[fd00::1", "[fd00::1]:27017", false},
+		{"::1", "localhost:27017", false},
+		{"::1", "localhost:37017", false},
+		{"0:0:0:0:0:0:0:1", "[::1]:27017", true},
+		{"fd00::1", "[fd00::1]:27017", true},
+	} {
+		c.Logf("test %d: %q %q", i, test.a, test.b)
+		c.Check(sameAddress(test.a, test.b), gc.Equals, test.want)
+		c.Check(sameAddress(test.b, test.a), gc.Equals, test.want)
+	}
 }
 
 type fmtConfigForLogSuite struct {
